@@ -1,7 +1,7 @@
 #!/bin/sh
 # nfmini - minimal ufw-like iptables/ip6tables manager (POSIX sh)
-# Supports: Debian 13 + Alpine 3.23 (no bash required)
-# Chains managed: filter INPUT/OUTPUT (+ policy), nat PREROUTING (REDIRECT)
+# Debian 13 + Alpine 3.23 (no bash required)
+# Manage: filter INPUT/OUTPUT (+ policy), nat PREROUTING (REDIRECT)
 # Commands: add / del / hop / status
 
 set -eu
@@ -12,10 +12,7 @@ IPT6="ip6tables"
 log() { printf '%s\n' "$*" >&2; }
 die() { log "ERROR: $*"; exit 1; }
 
-need_root() {
-  [ "$(id -u)" -eq 0 ] || die "Please run as root."
-}
-
+need_root() { [ "$(id -u)" -eq 0 ] || die "Please run as root."; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
 detect_os() {
@@ -29,7 +26,6 @@ detect_os() {
 }
 
 ensure_iptables_installed() {
-  # Ensure iptables + ip6tables commands exist; install if missing
   if have "$IPT4" && have "$IPT6"; then
     return 0
   fi
@@ -41,15 +37,13 @@ ensure_iptables_installed() {
       export DEBIAN_FRONTEND=noninteractive
       log "[*] Installing iptables + iptables-persistent (netfilter-persistent)..."
       apt-get update -y
-      # iptables-persistent pulls netfilter-persistent on Debian stable.
       apt-get install -y iptables iptables-persistent >/dev/null
       ;;
     alpine)
       have apk || die "apk not found (expected Alpine)."
       log "[*] Installing iptables (+ OpenRC scripts if needed)..."
       apk add --no-cache iptables >/dev/null
-      # OpenRC init scripts live in iptables-openrc subpackage on Alpine
-      if [ ! -e /etc/init.d/iptables ] && have apk; then
+      if [ ! -e /etc/init.d/iptables ]; then
         apk add --no-cache iptables-openrc >/dev/null 2>&1 || true
       fi
       ;;
@@ -69,14 +63,12 @@ persist_rules() {
       if have netfilter-persistent; then
         netfilter-persistent save >/dev/null 2>&1 || true
       else
-        # Fallback: common paths used by iptables-persistent
         mkdir -p /etc/iptables >/dev/null 2>&1 || true
         iptables-save > /etc/iptables/rules.v4
         ip6tables-save > /etc/iptables/rules.v6
       fi
       ;;
     alpine)
-      # Alpine wiki recommends rc-service iptables/ip6tables save :contentReference[oaicite:3]{index=3}
       if have rc-service && [ -e /etc/init.d/iptables ]; then
         rc-service iptables save >/dev/null 2>&1 || true
       fi
@@ -85,49 +77,45 @@ persist_rules() {
       fi
       ;;
     *)
-      # Do nothing
       ;;
   esac
 }
 
 default_iface() {
-  # Allow override via env IFACE
   if [ "${IFACE:-}" != "" ]; then
     echo "$IFACE"
     return 0
   fi
   if have ip; then
-    # Prefer IPv4 default route; fallback to first non-lo link
     iface="$(ip route 2>/dev/null | awk '/^default /{print $5; exit}')"
     if [ "$iface" = "" ]; then
       iface="$(ip link 2>/dev/null | awk -F': ' '/^[0-9]+: [^lo]/{print $2; exit}' | cut -d'@' -f1)"
     fi
     [ "$iface" != "" ] && { echo "$iface"; return 0; }
   fi
-  # Fallback common
   echo "eth0"
 }
 
-# ---------- rule primitives ----------
-ipt_check_add() {
-  # $1=cmd (iptables|ip6tables), rest = rule spec after -C/-A
-  cmd="$1"; shift
-  if "$cmd" -C "$@" >/dev/null 2>&1; then
+# ---------- filter rule helpers (no -t here; used for filter only) ----------
+ipt_check_add_filter() {
+  # $1=cmd (iptables|ip6tables), $2=chain, rest = rule
+  cmd="$1"; chain="$2"; shift 2
+  if "$cmd" -C "$chain" "$@" >/dev/null 2>&1; then
     return 0
   fi
-  "$cmd" -A "$@"
+  "$cmd" -A "$chain" "$@"
 }
 
-ipt_check_del_all() {
-  # delete all matching rules (loop while -C success)
-  cmd="$1"; shift
-  while "$cmd" -C "$@" >/dev/null 2>&1; do
-    "$cmd" -D "$@"
+ipt_check_del_all_filter() {
+  # delete all matching rules from filter chain
+  cmd="$1"; chain="$2"; shift 2
+  while "$cmd" -C "$chain" "$@" >/dev/null 2>&1; do
+    "$cmd" -D "$chain" "$@"
   done
 }
 
 chain_has_rules() {
-  # $1=cmd (iptables|ip6tables), $2=chain
+  # $1=cmd, $2=chain
   cmd="$1"; chain="$2"
   "$cmd" -S "$chain" 2>/dev/null | awk '/^-A /{found=1} END{exit(found?0:1)}'
 }
@@ -136,7 +124,6 @@ init_firewall_one() {
   # $1=cmd, $2=icmp_proto (icmp|ipv6-icmp)
   cmd="$1"; icmpp="$2"
 
-  # Filter table defaults + base rules
   "$cmd" -F INPUT || true
   "$cmd" -F OUTPUT || true
 
@@ -145,19 +132,19 @@ init_firewall_one() {
   "$cmd" -P OUTPUT ACCEPT
 
   # loopback
-  ipt_check_add "$cmd" INPUT -i lo -j ACCEPT
+  ipt_check_add_filter "$cmd" INPUT -i lo -j ACCEPT
   # established
-  ipt_check_add "$cmd" INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  ipt_check_add_filter "$cmd" INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
   # ICMP / ICMPv6
-  ipt_check_add "$cmd" INPUT -p "$icmpp" -j ACCEPT
+  ipt_check_add_filter "$cmd" INPUT -p "$icmpp" -j ACCEPT
 }
 
 ensure_initialized() {
-  # If IPv4 INPUT has no rules, treat as "empty" and init both v4/v6.
+  # If IPv4 INPUT has no rules, init both v4/v6 baseline.
   if chain_has_rules "$IPT4" INPUT; then
     return 0
   fi
-  log "[*] No existing INPUT rules detected; initializing minimal baseline (DROP INPUT/FORWARD, ACCEPT OUTPUT, allow lo+established+icmp)..."
+  log "[*] No existing INPUT rules detected; initializing baseline (DROP INPUT/FORWARD, ACCEPT OUTPUT, allow lo+established+icmp)..."
   init_firewall_one "$IPT4" "icmp"
   init_firewall_one "$IPT6" "ipv6-icmp"
 }
@@ -167,7 +154,7 @@ ensure_initialized() {
 #  - 40404/tcp
 #  - 51011                (defaults tcp+udp)
 #  - 51010-51111/udp
-# Output globals: PORTSPEC (single "x" or range "x:y"), PROTOS ("tcp udp" or "udp" etc.)
+# Output globals: PORTSPEC ("x" or "x:y"), PROTOS ("tcp udp" or "udp"/"tcp")
 parse_port_spec() {
   spec="$1"
   spec="$(printf '%s' "$spec" | tr -d '[:space:]')"
@@ -182,19 +169,15 @@ parse_port_spec() {
       ;;
   esac
 
-  # protocols
   if [ "$proto" = "" ]; then
     PROTOS="tcp udp"
   else
     case "$proto" in
       tcp|udp) PROTOS="$proto" ;;
-      *)
-        die "Unknown protocol in '$spec' (use tcp or udp)."
-        ;;
+      *) die "Unknown protocol in '$spec' (use tcp or udp)." ;;
     esac
   fi
 
-  # port / range
   case "$portpart" in
     *-*)
       start="${portpart%-*}"
@@ -206,16 +189,11 @@ parse_port_spec() {
       ;;
   esac
 
-  case "$start" in
-    ""|*[!0-9]*) die "Invalid port in '$spec'." ;;
-  esac
+  case "$start" in ""|*[!0-9]*) die "Invalid port in '$spec'." ;; esac
   if [ "$end" != "" ]; then
-    case "$end" in
-      ""|*[!0-9]*) die "Invalid port range in '$spec'." ;;
-    esac
+    case "$end" in ""|*[!0-9]*) die "Invalid port range in '$spec'." ;; esac
   fi
 
-  # bounds
   [ "$start" -ge 1 ] && [ "$start" -le 65535 ] || die "Port out of range in '$spec'."
   if [ "$end" != "" ]; then
     [ "$end" -ge 1 ] && [ "$end" -le 65535 ] || die "Port out of range in '$spec'."
@@ -226,27 +204,23 @@ parse_port_spec() {
   fi
 }
 
+# ---------- add/del ----------
 add_ports() {
   ensure_initialized
-
-  # Accept NEW inbound on INPUT for specified dports.
-  # OUTPUT is ACCEPT by default in baseline (no need to add).
   for spec in "$@"; do
     parse_port_spec "$spec"
     for p in $PROTOS; do
-      ipt_check_add "$IPT4" INPUT -p "$p" -m conntrack --ctstate NEW -m "$p" --dport "$PORTSPEC" -j ACCEPT
-      ipt_check_add "$IPT6" INPUT -p "$p" -m conntrack --ctstate NEW -m "$p" --dport "$PORTSPEC" -j ACCEPT
+      ipt_check_add_filter "$IPT4" INPUT -p "$p" -m conntrack --ctstate NEW -m "$p" --dport "$PORTSPEC" -j ACCEPT
+      ipt_check_add_filter "$IPT6" INPUT -p "$p" -m conntrack --ctstate NEW -m "$p" --dport "$PORTSPEC" -j ACCEPT
     done
     log "[+] opened: $spec"
   done
-
   persist_rules
 }
 
 del_ports() {
-  # If no args: flush INPUT/OUTPUT and allow all inbound/outbound (policies ACCEPT).
   if [ "$#" -eq 0 ]; then
-    log "[*] Clearing INPUT/OUTPUT rules and allowing all inbound/outbound (policies ACCEPT)..."
+    log "[*] Clearing INPUT/OUTPUT and allowing all inbound/outbound (policies ACCEPT)..."
     for cmd in "$IPT4" "$IPT6"; do
       "$cmd" -F INPUT || true
       "$cmd" -F OUTPUT || true
@@ -261,38 +235,43 @@ del_ports() {
   for spec in "$@"; do
     parse_port_spec "$spec"
     for p in $PROTOS; do
-      ipt_check_del_all "$IPT4" INPUT -p "$p" -m conntrack --ctstate NEW -m "$p" --dport "$PORTSPEC" -j ACCEPT
-      ipt_check_del_all "$IPT6" INPUT -p "$p" -m conntrack --ctstate NEW -m "$p" --dport "$PORTSPEC" -j ACCEPT
+      ipt_check_del_all_filter "$IPT4" INPUT -p "$p" -m conntrack --ctstate NEW -m "$p" --dport "$PORTSPEC" -j ACCEPT
+      ipt_check_del_all_filter "$IPT6" INPUT -p "$p" -m conntrack --ctstate NEW -m "$p" --dport "$PORTSPEC" -j ACCEPT
     done
     log "[-] removed: $spec"
   done
-
   persist_rules
 }
 
+# ---------- hop (nat PREROUTING REDIRECT) ----------
+# 关键：iptables 的 -t nat 必须放在 -A/-C/-D 前面，所以 hop 不走 filter wrapper。
 hop_add() {
   # hop add <to_port> <from_range[/proto]> [iface]
   to="$1"; from="$2"; iface="${3:-$(default_iface)}"
   case "$to" in ""|*[!0-9]*) die "Invalid to_port '$to'." ;; esac
   [ "$to" -ge 1 ] && [ "$to" -le 65535 ] || die "to_port out of range."
 
-  parse_port_spec "$from"  # sets PORTSPEC + PROTOS
+  parse_port_spec "$from"   # 无 /proto => PROTOS="tcp udp"（你要的默认 tcp+udp）
 
   for p in $PROTOS; do
     # IPv4
-    if ! "$IPT4" -t nat -C PREROUTING -i "$iface" -p "$p" -m "$p" --dport "$PORTSPEC" -j REDIRECT --to-ports "$to" >/dev/null 2>&1; then
-      "$IPT4" -t nat -A PREROUTING -i "$iface" -p "$p" -m "$p" --dport "$PORTSPEC" -j REDIRECT --to-ports "$to"
+    if ! "$IPT4" -t nat -C PREROUTING -i "$iface" -p "$p" -m "$p" --dport "$PORTSPEC" \
+        -j REDIRECT --to-ports "$to" >/dev/null 2>&1; then
+      "$IPT4" -t nat -A PREROUTING -i "$iface" -p "$p" -m "$p" --dport "$PORTSPEC" \
+        -j REDIRECT --to-ports "$to"
     fi
 
-    # IPv6 (best-effort)
+    # IPv6 best-effort (有些环境 ip6 nat 不可用；失败不致命)
     if have "$IPT6"; then
-      if ! "$IPT6" -t nat -C PREROUTING -i "$iface" -p "$p" -m "$p" --dport "$PORTSPEC" -j REDIRECT --to-ports "$to" >/dev/null 2>&1; then
-        "$IPT6" -t nat -A PREROUTING -i "$iface" -p "$p" -m "$p" --dport "$PORTSPEC" -j REDIRECT --to-ports "$to" >/dev/null 2>&1 || true
+      if ! "$IPT6" -t nat -C PREROUTING -i "$iface" -p "$p" -m "$p" --dport "$PORTSPEC" \
+          -j REDIRECT --to-ports "$to" >/dev/null 2>&1; then
+        "$IPT6" -t nat -A PREROUTING -i "$iface" -p "$p" -m "$p" --dport "$PORTSPEC" \
+          -j REDIRECT --to-ports "$to" >/dev/null 2>&1 || true
       fi
     fi
   done
 
-  log "[+] hop add: ${from} -> ${to} (iface=$iface)"
+  log "[+] hop add: ${from} -> ${to} (iface=$iface, proto=${PROTOS})"
   persist_rules
 }
 
@@ -314,19 +293,23 @@ hop_del() {
 
   for p in $PROTOS; do
     # IPv4 delete all matching
-    while "$IPT4" -t nat -C PREROUTING -i "$iface" -p "$p" -m "$p" --dport "$PORTSPEC" -j REDIRECT --to-ports "$to" >/dev/null 2>&1; do
-      "$IPT4" -t nat -D PREROUTING -i "$iface" -p "$p" -m "$p" --dport "$PORTSPEC" -j REDIRECT --to-ports "$to"
+    while "$IPT4" -t nat -C PREROUTING -i "$iface" -p "$p" -m "$p" --dport "$PORTSPEC" \
+        -j REDIRECT --to-ports "$to" >/dev/null 2>&1; do
+      "$IPT4" -t nat -D PREROUTING -i "$iface" -p "$p" -m "$p" --dport "$PORTSPEC" \
+        -j REDIRECT --to-ports "$to"
     done
 
     # IPv6 best-effort delete all matching
     if have "$IPT6"; then
-      while "$IPT6" -t nat -C PREROUTING -i "$iface" -p "$p" -m "$p" --dport "$PORTSPEC" -j REDIRECT --to-ports "$to" >/dev/null 2>&1; do
-        "$IPT6" -t nat -D PREROUTING -i "$iface" -p "$p" -m "$p" --dport "$PORTSPEC" -j REDIRECT --to-ports "$to" >/dev/null 2>&1 || break
+      while "$IPT6" -t nat -C PREROUTING -i "$iface" -p "$p" -m "$p" --dport "$PORTSPEC" \
+          -j REDIRECT --to-ports "$to" >/dev/null 2>&1; do
+        "$IPT6" -t nat -D PREROUTING -i "$iface" -p "$p" -m "$p" --dport "$PORTSPEC" \
+          -j REDIRECT --to-ports "$to" >/dev/null 2>&1 || break
       done
     fi
   done
 
-  log "[-] hop del: ${from} -> ${to} (iface=$iface)"
+  log "[-] hop del: ${from} -> ${to} (iface=$iface, proto=${PROTOS})"
   persist_rules
 }
 
@@ -350,20 +333,19 @@ status_all() {
 
 usage() {
   cat <<'EOF'
-nfmini usage:
+Usage:
   nfmini add [PORTSPEC ...]
       PORTSPEC examples:
         40404/tcp
         51011              (default tcp+udp)
         51010-51111/udp
-
       If no PORTSPEC provided, enters interactive mode.
 
   nfmini del [PORTSPEC ...]
       If no PORTSPEC: flush INPUT/OUTPUT and set policies ACCEPT (allow all inbound/outbound).
 
   nfmini hop add <TO_PORT> <FROM_RANGE[/proto]> [iface]
-      Example:
+      Examples:
         nfmini hop add 51010 51011-51111        (default tcp+udp)
         nfmini hop add 51010 51011-51111/udp
         IFACE=eth0 nfmini hop add 51010 51011-51111/udp
@@ -388,7 +370,6 @@ main() {
       if [ "$#" -eq 0 ]; then
         printf "Enter ports to open (e.g. 40404/tcp, 51011, 51010-51111/udp):\n> " >&2
         IFS= read -r line || exit 1
-        # split by comma/space
         line="$(printf '%s' "$line" | tr ',' ' ')"
         set -- $line
         [ "$#" -gt 0 ] || die "No ports provided."
