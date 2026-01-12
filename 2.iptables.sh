@@ -3,6 +3,21 @@
 # Debian 13 + Alpine 3.23 (no bash required)
 # Manage: filter INPUT/OUTPUT (+ policy), nat PREROUTING (REDIRECT)
 # Commands: add / del / hop / status
+#
+# Spec format (add/del):
+#   PORT[-PORT][/proto][/family]
+#   examples:
+#     50101            => tcp+udp, v4+v6
+#     50101/tcp        => tcp, v4+v6
+#     50101/tcp/6      => tcp, v6 only
+#     51010-51111/udp/4=> udp, v4 only
+#
+# Spec format (hop fromspec):
+#   PORT[-PORT][/proto][/family]
+#   examples:
+#     51011-51111      => tcp+udp, v4+v6
+#     51011/udp        => udp only, v4+v6
+#     51011-51111/udp/4=> udp only, v4 only
 
 set -eu
 
@@ -96,9 +111,9 @@ default_iface() {
   echo "eth0"
 }
 
-# ---------- filter rule helpers (no -t here; used for filter only) ----------
+# ---------- filter rule helpers ----------
 ipt_check_add_filter() {
-  # $1=cmd (iptables|ip6tables), $2=chain, rest = rule
+  # $1=cmd, $2=chain, rest=rule
   cmd="$1"; chain="$2"; shift 2
   if "$cmd" -C "$chain" "$@" >/dev/null 2>&1; then
     return 0
@@ -107,7 +122,7 @@ ipt_check_add_filter() {
 }
 
 ipt_check_del_all_filter() {
-  # delete all matching rules from filter chain
+  # $1=cmd, $2=chain, rest=rule
   cmd="$1"; chain="$2"; shift 2
   while "$cmd" -C "$chain" "$@" >/dev/null 2>&1; do
     "$cmd" -D "$chain" "$@"
@@ -131,16 +146,13 @@ init_firewall_one() {
   "$cmd" -P FORWARD DROP
   "$cmd" -P OUTPUT ACCEPT
 
-  # loopback
   ipt_check_add_filter "$cmd" INPUT -i lo -j ACCEPT
-  # established
   ipt_check_add_filter "$cmd" INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-  # ICMP / ICMPv6
   ipt_check_add_filter "$cmd" INPUT -p "$icmpp" -j ACCEPT
 }
 
 ensure_initialized() {
-  # If IPv4 INPUT has no rules, init both v4/v6 baseline.
+  # baseline init if IPv4 INPUT has no rules
   if chain_has_rules "$IPT4" INPUT; then
     return 0
   fi
@@ -149,35 +161,57 @@ ensure_initialized() {
   init_firewall_one "$IPT6" "ipv6-icmp"
 }
 
-# ---------- port spec parsing ----------
-# Accept:
-#  - 40404/tcp
-#  - 51011                (defaults tcp+udp)
-#  - 51010-51111/udp
-# Output globals: PORTSPEC ("x" or "x:y"), PROTOS ("tcp udp" or "udp"/"tcp")
-parse_port_spec() {
-  spec="$1"
-  spec="$(printf '%s' "$spec" | tr -d '[:space:]')"
-  [ "$spec" != "" ] || die "Empty port spec."
+# ---------- spec parsing ----------
+# Output globals:
+#   PORTSPEC: "x" or "x:y"
+#   PROTOS: "tcp udp" or "tcp" or "udp"
+#   FAMS: "4 6" or "4" or "6"
+parse_spec() {
+  spec_raw="$1"
+  spec="$(printf '%s' "$spec_raw" | tr -d '[:space:]')"
+  [ "$spec" != "" ] || die "Empty spec."
 
-  proto=""
-  portpart="$spec"
+  # split by '/'
+  portpart="${spec%%/*}"
+  rest=""
   case "$spec" in
-    */*)
-      portpart="${spec%/*}"
-      proto="${spec#*/}"
-      ;;
+    */*) rest="${spec#*/}" ;;
   esac
 
-  if [ "$proto" = "" ]; then
-    PROTOS="tcp udp"
-  else
-    case "$proto" in
-      tcp|udp) PROTOS="$proto" ;;
-      *) die "Unknown protocol in '$spec' (use tcp or udp)." ;;
+  # defaults
+  PROTOS="tcp udp"
+  FAMS="4 6"
+
+  # parse rest tokens (0..2 tokens, accept any order)
+  if [ "$rest" != "" ]; then
+    # rest may contain one or more '/'
+    t1="${rest%%/*}"
+    t2=""
+    case "$rest" in
+      */*) t2="${rest#*/}" ;;
     esac
+
+    apply_token() {
+      tok="$1"
+      [ "$tok" = "" ] && return 0
+      case "$tok" in
+        tcp|udp)
+          PROTOS="$tok"
+          ;;
+        4|6)
+          FAMS="$tok"
+          ;;
+        *)
+          die "Unknown token '$tok' in '$spec_raw' (use tcp/udp and/or 4/6)."
+          ;;
+      esac
+    }
+
+    apply_token "$t1"
+    apply_token "$t2"
   fi
 
+  # parse port/range
   case "$portpart" in
     *-*)
       start="${portpart%-*}"
@@ -189,38 +223,50 @@ parse_port_spec() {
       ;;
   esac
 
-  case "$start" in ""|*[!0-9]*) die "Invalid port in '$spec'." ;; esac
+  case "$start" in ""|*[!0-9]*) die "Invalid port in '$spec_raw'." ;; esac
   if [ "$end" != "" ]; then
-    case "$end" in ""|*[!0-9]*) die "Invalid port range in '$spec'." ;; esac
+    case "$end" in ""|*[!0-9]*) die "Invalid port range in '$spec_raw'." ;; esac
   fi
 
-  [ "$start" -ge 1 ] && [ "$start" -le 65535 ] || die "Port out of range in '$spec'."
+  [ "$start" -ge 1 ] && [ "$start" -le 65535 ] || die "Port out of range in '$spec_raw'."
   if [ "$end" != "" ]; then
-    [ "$end" -ge 1 ] && [ "$end" -le 65535 ] || die "Port out of range in '$spec'."
-    [ "$start" -le "$end" ] || die "Range start > end in '$spec'."
+    [ "$end" -ge 1 ] && [ "$end" -le 65535 ] || die "Port out of range in '$spec_raw'."
+    [ "$start" -le "$end" ] || die "Range start > end in '$spec_raw'."
     PORTSPEC="${start}:${end}"
   else
     PORTSPEC="$start"
   fi
 }
 
+fam_has4() { echo "$FAMS" | grep -q '4'; }
+fam_has6() { echo "$FAMS" | grep -q '6'; }
+
 # ---------- add/del ----------
 add_ports() {
   ensure_initialized
+
   for spec in "$@"; do
-    parse_port_spec "$spec"
+    parse_spec "$spec"
+
     for p in $PROTOS; do
-      ipt_check_add_filter "$IPT4" INPUT -p "$p" -m conntrack --ctstate NEW -m "$p" --dport "$PORTSPEC" -j ACCEPT
-      ipt_check_add_filter "$IPT6" INPUT -p "$p" -m conntrack --ctstate NEW -m "$p" --dport "$PORTSPEC" -j ACCEPT
+      if fam_has4; then
+        ipt_check_add_filter "$IPT4" INPUT -p "$p" -m conntrack --ctstate NEW -m "$p" --dport "$PORTSPEC" -j ACCEPT
+      fi
+      if fam_has6; then
+        ipt_check_add_filter "$IPT6" INPUT -p "$p" -m conntrack --ctstate NEW -m "$p" --dport "$PORTSPEC" -j ACCEPT
+      fi
     done
-    log "[+] opened: $spec"
+
+    log "[+] opened: $spec  (proto=$PROTOS, fam=$FAMS)"
   done
+
   persist_rules
 }
 
 del_ports() {
+  # If no args: flush INPUT/OUTPUT and allow all inbound/outbound for BOTH families.
   if [ "$#" -eq 0 ]; then
-    log "[*] Clearing INPUT/OUTPUT and allowing all inbound/outbound (policies ACCEPT)..."
+    log "[*] Clearing INPUT/OUTPUT and allowing all inbound/outbound (policies ACCEPT) for v4+v6..."
     for cmd in "$IPT4" "$IPT6"; do
       "$cmd" -F INPUT || true
       "$cmd" -F OUTPUT || true
@@ -233,36 +279,44 @@ del_ports() {
   fi
 
   for spec in "$@"; do
-    parse_port_spec "$spec"
+    parse_spec "$spec"
+
     for p in $PROTOS; do
-      ipt_check_del_all_filter "$IPT4" INPUT -p "$p" -m conntrack --ctstate NEW -m "$p" --dport "$PORTSPEC" -j ACCEPT
-      ipt_check_del_all_filter "$IPT6" INPUT -p "$p" -m conntrack --ctstate NEW -m "$p" --dport "$PORTSPEC" -j ACCEPT
+      if fam_has4; then
+        ipt_check_del_all_filter "$IPT4" INPUT -p "$p" -m conntrack --ctstate NEW -m "$p" --dport "$PORTSPEC" -j ACCEPT
+      fi
+      if fam_has6; then
+        ipt_check_del_all_filter "$IPT6" INPUT -p "$p" -m conntrack --ctstate NEW -m "$p" --dport "$PORTSPEC" -j ACCEPT
+      fi
     done
-    log "[-] removed: $spec"
+
+    log "[-] removed: $spec  (proto=$PROTOS, fam=$FAMS)"
   done
+
   persist_rules
 }
 
 # ---------- hop (nat PREROUTING REDIRECT) ----------
-# 关键：iptables 的 -t nat 必须放在 -A/-C/-D 前面，所以 hop 不走 filter wrapper。
+# NOTE: iptables -t nat must be before -A/-C/-D (can't use filter wrapper)
 hop_add() {
-  # hop add <to_port> <from_range[/proto]> [iface]
-  to="$1"; from="$2"; iface="${3:-$(default_iface)}"
+  # hop add <to_port> <fromspec> [iface]
+  to="$1"; fromspec="$2"; iface="${3:-$(default_iface)}"
   case "$to" in ""|*[!0-9]*) die "Invalid to_port '$to'." ;; esac
   [ "$to" -ge 1 ] && [ "$to" -le 65535 ] || die "to_port out of range."
 
-  parse_port_spec "$from"   # 无 /proto => PROTOS="tcp udp"（你要的默认 tcp+udp）
+  parse_spec "$fromspec"  # fromspec controls proto + family; proto default tcp+udp, fam default 4+6
 
   for p in $PROTOS; do
-    # IPv4
-    if ! "$IPT4" -t nat -C PREROUTING -i "$iface" -p "$p" -m "$p" --dport "$PORTSPEC" \
-        -j REDIRECT --to-ports "$to" >/dev/null 2>&1; then
-      "$IPT4" -t nat -A PREROUTING -i "$iface" -p "$p" -m "$p" --dport "$PORTSPEC" \
-        -j REDIRECT --to-ports "$to"
+    if fam_has4; then
+      if ! "$IPT4" -t nat -C PREROUTING -i "$iface" -p "$p" -m "$p" --dport "$PORTSPEC" \
+          -j REDIRECT --to-ports "$to" >/dev/null 2>&1; then
+        "$IPT4" -t nat -A PREROUTING -i "$iface" -p "$p" -m "$p" --dport "$PORTSPEC" \
+          -j REDIRECT --to-ports "$to"
+      fi
     fi
 
-    # IPv6 best-effort (有些环境 ip6 nat 不可用；失败不致命)
-    if have "$IPT6"; then
+    if fam_has6; then
+      # best-effort: some envs lack ip6 nat; failures are non-fatal
       if ! "$IPT6" -t nat -C PREROUTING -i "$iface" -p "$p" -m "$p" --dport "$PORTSPEC" \
           -j REDIRECT --to-ports "$to" >/dev/null 2>&1; then
         "$IPT6" -t nat -A PREROUTING -i "$iface" -p "$p" -m "$p" --dport "$PORTSPEC" \
@@ -271,36 +325,36 @@ hop_add() {
     fi
   done
 
-  log "[+] hop add: ${from} -> ${to} (iface=$iface, proto=${PROTOS})"
+  log "[+] hop add: ${fromspec} -> ${to} (iface=$iface, proto=$PROTOS, fam=$FAMS)"
   persist_rules
 }
 
 hop_del() {
-  # hop del [<to_port> <from_range[/proto]> [iface]]
+  # hop del [<to_port> <fromspec> [iface]]
   if [ "$#" -eq 0 ]; then
-    log "[*] hop del (no args): flushing nat PREROUTING..."
+    log "[*] hop del (no args): flushing nat PREROUTING for v4+v6..."
     "$IPT4" -t nat -F PREROUTING || true
     "$IPT6" -t nat -F PREROUTING || true
     persist_rules
     return 0
   fi
 
-  to="$1"; from="$2"; iface="${3:-$(default_iface)}"
+  to="$1"; fromspec="$2"; iface="${3:-$(default_iface)}"
   case "$to" in ""|*[!0-9]*) die "Invalid to_port '$to'." ;; esac
   [ "$to" -ge 1 ] && [ "$to" -le 65535 ] || die "to_port out of range."
 
-  parse_port_spec "$from"
+  parse_spec "$fromspec"
 
   for p in $PROTOS; do
-    # IPv4 delete all matching
-    while "$IPT4" -t nat -C PREROUTING -i "$iface" -p "$p" -m "$p" --dport "$PORTSPEC" \
-        -j REDIRECT --to-ports "$to" >/dev/null 2>&1; do
-      "$IPT4" -t nat -D PREROUTING -i "$iface" -p "$p" -m "$p" --dport "$PORTSPEC" \
-        -j REDIRECT --to-ports "$to"
-    done
+    if fam_has4; then
+      while "$IPT4" -t nat -C PREROUTING -i "$iface" -p "$p" -m "$p" --dport "$PORTSPEC" \
+          -j REDIRECT --to-ports "$to" >/dev/null 2>&1; do
+        "$IPT4" -t nat -D PREROUTING -i "$iface" -p "$p" -m "$p" --dport "$PORTSPEC" \
+          -j REDIRECT --to-ports "$to"
+      done
+    fi
 
-    # IPv6 best-effort delete all matching
-    if have "$IPT6"; then
+    if fam_has6; then
       while "$IPT6" -t nat -C PREROUTING -i "$iface" -p "$p" -m "$p" --dport "$PORTSPEC" \
           -j REDIRECT --to-ports "$to" >/dev/null 2>&1; do
         "$IPT6" -t nat -D PREROUTING -i "$iface" -p "$p" -m "$p" --dport "$PORTSPEC" \
@@ -309,7 +363,7 @@ hop_del() {
     fi
   done
 
-  log "[-] hop del: ${from} -> ${to} (iface=$iface, proto=${PROTOS})"
+  log "[-] hop del: ${fromspec} -> ${to} (iface=$iface, proto=$PROTOS, fam=$FAMS)"
   persist_rules
 }
 
@@ -334,24 +388,28 @@ status_all() {
 usage() {
   cat <<'EOF'
 Usage:
-  nfmini add [PORTSPEC ...]
-      PORTSPEC examples:
-        40404/tcp
-        51011              (default tcp+udp)
-        51010-51111/udp
-      If no PORTSPEC provided, enters interactive mode.
+  nfmini add [SPEC ...]
+      SPEC: PORT[-PORT][/proto][/family]
+      examples:
+        nfmini add 50101
+        nfmini add 50101/tcp
+        nfmini add 50101/tcp/6
+        nfmini add 51010-51111/udp/4
+      If no SPEC provided, enters interactive mode.
 
-  nfmini del [PORTSPEC ...]
-      If no PORTSPEC: flush INPUT/OUTPUT and set policies ACCEPT (allow all inbound/outbound).
+  nfmini del [SPEC ...]
+      If no SPEC: flush INPUT/OUTPUT and set policies ACCEPT (allow all inbound/outbound) for v4+v6.
 
-  nfmini hop add <TO_PORT> <FROM_RANGE[/proto]> [iface]
-      Examples:
-        nfmini hop add 51010 51011-51111        (default tcp+udp)
-        nfmini hop add 51010 51011-51111/udp
-        IFACE=eth0 nfmini hop add 51010 51011-51111/udp
+  nfmini hop add <TO_PORT> <FROMSPEC> [iface]
+      FROMSPEC: PORT[-PORT][/proto][/family]
+      examples:
+        nfmini hop add 51010 51011-51111          (tcp+udp, v4+v6)
+        nfmini hop add 51010 51011/udp            (udp only, v4+v6)
+        nfmini hop add 51010 51011-51111/udp/4    (udp only, v4 only)
+        IFACE=eth0 nfmini hop add 51010 51011/udp/6
 
-  nfmini hop del [<TO_PORT> <FROM_RANGE[/proto]> [iface]]
-      If no args: flush nat PREROUTING (IPv4+IPv6).
+  nfmini hop del [<TO_PORT> <FROMSPEC> [iface]]
+      If no args: flush nat PREROUTING for v4+v6.
 
   nfmini hop status
   nfmini status
@@ -368,11 +426,11 @@ main() {
   case "$cmd" in
     add)
       if [ "$#" -eq 0 ]; then
-        printf "Enter ports to open (e.g. 40404/tcp, 51011, 51010-51111/udp):\n> " >&2
+        printf "Enter specs to open (e.g. 40404/tcp, 51011, 51010-51111/udp/4, 50101/tcp/6):\n> " >&2
         IFS= read -r line || exit 1
         line="$(printf '%s' "$line" | tr ',' ' ')"
         set -- $line
-        [ "$#" -gt 0 ] || die "No ports provided."
+        [ "$#" -gt 0 ] || die "No specs provided."
       fi
       add_ports "$@"
       ;;
@@ -383,14 +441,14 @@ main() {
       sub="${1:-}"; shift || true
       case "$sub" in
         add)
-          [ "$#" -ge 2 ] || die "hop add needs: <to_port> <from_range[/proto]> [iface]"
+          [ "$#" -ge 2 ] || die "hop add needs: <to_port> <fromspec> [iface]"
           hop_add "$@"
           ;;
         del)
           if [ "$#" -eq 0 ]; then
             hop_del
           else
-            [ "$#" -ge 2 ] || die "hop del needs: <to_port> <from_range[/proto]> [iface]  (or no args to flush)"
+            [ "$#" -ge 2 ] || die "hop del needs: <to_port> <fromspec> [iface]  (or no args to flush)"
             hop_del "$@"
           fi
           ;;
