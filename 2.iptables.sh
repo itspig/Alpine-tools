@@ -3,19 +3,6 @@
 # Debian 13 + Alpine 3.23 (no bash required)
 # Manage: filter INPUT/OUTPUT (+ policy), nat PREROUTING (REDIRECT)
 # Commands: add / del / hop / status
-#
-# SPEC format (add/del):
-#   PORT[-PORT][/proto][/family]
-#   50101            => tcp+udp, v4+v6
-#   50101/tcp        => tcp, v4+v6
-#   50101/tcp/6      => tcp, v6 only
-#   51010-51111/udp/4=> udp, v4 only
-#
-# FROMSPEC format (hop):
-#   PORT[-PORT][/proto][/family]
-#   51011-51111      => tcp+udp, v4+v6
-#   51011/udp        => udp only, v4+v6
-#   51011-51111/udp/4=> udp only, v4 only
 
 set -eu
 
@@ -69,28 +56,48 @@ ensure_iptables_installed() {
   have "$IPT6" || die "ip6tables still missing after install."
 }
 
+# --- persistence (improved for Alpine) ---
+persist_rules_alpine() {
+  # Always save to files used by OpenRC iptables scripts.
+  mkdir -p /etc/iptables >/dev/null 2>&1 || true
+  if have iptables-save; then
+    iptables-save > /etc/iptables/rules-save 2>/dev/null || true
+  fi
+  if have ip6tables-save; then
+    ip6tables-save > /etc/iptables/rules6-save 2>/dev/null || true
+  fi
+
+  # If OpenRC is present, enable + start services so reboot restores.
+  if have rc-update && have rc-service; then
+    if [ -e /etc/init.d/iptables ]; then
+      rc-update add iptables default >/dev/null 2>&1 || true
+      rc-service iptables start >/dev/null 2>&1 || true
+      rc-service iptables save >/dev/null 2>&1 || true
+    fi
+    if [ -e /etc/init.d/ip6tables ]; then
+      rc-update add ip6tables default >/dev/null 2>&1 || true
+      rc-service ip6tables start >/dev/null 2>&1 || true
+      rc-service ip6tables save >/dev/null 2>&1 || true
+    fi
+  fi
+}
+
+persist_rules_debian() {
+  if have netfilter-persistent; then
+    netfilter-persistent save >/dev/null 2>&1 || true
+  else
+    mkdir -p /etc/iptables >/dev/null 2>&1 || true
+    iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+    ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
+  fi
+}
+
 persist_rules() {
   os="$(detect_os)"
   case "$os" in
-    debian)
-      if have netfilter-persistent; then
-        netfilter-persistent save >/dev/null 2>&1 || true
-      else
-        mkdir -p /etc/iptables >/dev/null 2>&1 || true
-        iptables-save > /etc/iptables/rules.v4
-        ip6tables-save > /etc/iptables/rules.v6
-      fi
-      ;;
-    alpine)
-      if have rc-service && [ -e /etc/init.d/iptables ]; then
-        rc-service iptables save >/dev/null 2>&1 || true
-      fi
-      if have rc-service && [ -e /etc/init.d/ip6tables ]; then
-        rc-service ip6tables save >/dev/null 2>&1 || true
-      fi
-      ;;
-    *)
-      ;;
+    alpine) persist_rules_alpine ;;
+    debian) persist_rules_debian ;;
+    *) ;;
   esac
 }
 
@@ -111,7 +118,6 @@ default_iface() {
 
 # ---------- filter rule helpers ----------
 ipt_check_add_filter() {
-  # $1=cmd, $2=chain, rest=rule
   cmd="$1"; chain="$2"; shift 2
   if "$cmd" -C "$chain" "$@" >/dev/null 2>&1; then
     return 0
@@ -120,7 +126,6 @@ ipt_check_add_filter() {
 }
 
 ipt_check_del_all_filter() {
-  # $1=cmd, $2=chain, rest=rule
   cmd="$1"; chain="$2"; shift 2
   while "$cmd" -C "$chain" "$@" >/dev/null 2>&1; do
     "$cmd" -D "$chain" "$@"
@@ -128,13 +133,11 @@ ipt_check_del_all_filter() {
 }
 
 chain_has_rules() {
-  # $1=cmd, $2=chain
   cmd="$1"; chain="$2"
   "$cmd" -S "$chain" 2>/dev/null | awk '/^-A /{found=1} END{exit(found?0:1)}'
 }
 
 init_firewall_one() {
-  # $1=cmd, $2=icmp_proto, $3=family (4|6)
   cmd="$1"; icmpp="$2"; fam="$3"
 
   "$cmd" -F INPUT || true
@@ -144,25 +147,19 @@ init_firewall_one() {
   "$cmd" -P FORWARD DROP
   "$cmd" -P OUTPUT ACCEPT
 
-  # loopback
   ipt_check_add_filter "$cmd" INPUT -i lo -j ACCEPT
-  # established
   ipt_check_add_filter "$cmd" INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-  # ICMP / ICMPv6 (IPv6 RA/ND 依赖 icmpv6)
   ipt_check_add_filter "$cmd" INPUT -p "$icmpp" -j ACCEPT
 
-  # DHCP safety net (避免 DHCP/DHCPv6 回包被 INPUT DROP)
+  # DHCP safety net
   if [ "$fam" = "4" ]; then
-    # DHCPv4: server 67 -> client 68
     ipt_check_add_filter "$cmd" INPUT -p udp -m udp --sport 67 --dport 68 -j ACCEPT
   else
-    # DHCPv6: server 547 -> client 546
     ipt_check_add_filter "$cmd" INPUT -p udp -m udp --sport 547 --dport 546 -j ACCEPT
   fi
 }
 
 ensure_initialized() {
-  # init baseline only when IPv4 INPUT has no rules
   if chain_has_rules "$IPT4" INPUT; then
     return 0
   fi
@@ -172,10 +169,7 @@ ensure_initialized() {
 }
 
 # ---------- spec parsing ----------
-# Output globals:
-#   PORTSPEC: "x" or "x:y"
-#   PROTOS: "tcp udp" or "tcp" or "udp"
-#   FAMS: "4 6" or "4" or "6"
+# Output globals: PORTSPEC, PROTOS, FAMS
 parse_spec() {
   spec_raw="$1"
   spec="$(printf '%s' "$spec_raw" | tr -d '[:space:]')"
@@ -183,9 +177,7 @@ parse_spec() {
 
   portpart="${spec%%/*}"
   rest=""
-  case "$spec" in
-    */*) rest="${spec#*/}" ;;
-  esac
+  case "$spec" in */*) rest="${spec#*/}" ;; esac
 
   PROTOS="tcp udp"
   FAMS="4 6"
@@ -193,6 +185,7 @@ parse_spec() {
   if [ "$rest" != "" ]; then
     oldIFS="$IFS"
     IFS='/'
+    # split tokens into $@
     # shellcheck disable=SC2086
     set -- $rest
     IFS="$oldIFS"
@@ -208,14 +201,8 @@ parse_spec() {
   fi
 
   case "$portpart" in
-    *-*)
-      start="${portpart%-*}"
-      end="${portpart#*-}"
-      ;;
-    *)
-      start="$portpart"
-      end=""
-      ;;
+    *-*) start="${portpart%-*}"; end="${portpart#*-}" ;;
+    *)   start="$portpart"; end="" ;;
   esac
 
   case "$start" in ""|*[!0-9]*) die "Invalid port in '$spec_raw'." ;; esac
@@ -255,7 +242,6 @@ add_ports() {
 }
 
 del_ports() {
-  # no args: flush INPUT/OUTPUT and allow all inbound/outbound for BOTH families
   if [ "$#" -eq 0 ]; then
     log "[*] Clearing INPUT/OUTPUT and allowing all inbound/outbound (policies ACCEPT) for v4+v6..."
     for cmd in "$IPT4" "$IPT6"; do
@@ -281,13 +267,11 @@ del_ports() {
     done
     log "[-] removed: $spec  (proto=$PROTOS, fam=$FAMS)"
   done
-
   persist_rules
 }
 
 # ---------- hop (nat PREROUTING REDIRECT) ----------
 hop_add() {
-  # hop add <to_port> <fromspec> [iface]
   to="$1"; fromspec="$2"; iface="${3:-$(default_iface)}"
   case "$to" in ""|*[!0-9]*) die "Invalid to_port '$to'." ;; esac
   [ "$to" -ge 1 ] && [ "$to" -le 65535 ] || die "to_port out of range."
@@ -302,7 +286,6 @@ hop_add() {
     fi
 
     if fam_has6; then
-      # best-effort: some envs may not support ip6 nat; non-fatal
       if ! "$IPT6" -t nat -C PREROUTING -i "$iface" -p "$p" -m "$p" --dport "$PORTSPEC" -j REDIRECT --to-ports "$to" >/dev/null 2>&1; then
         "$IPT6" -t nat -A PREROUTING -i "$iface" -p "$p" -m "$p" --dport "$PORTSPEC" -j REDIRECT --to-ports "$to" >/dev/null 2>&1 || true
       fi
@@ -314,7 +297,6 @@ hop_add() {
 }
 
 hop_del() {
-  # hop del [<to_port> <fromspec> [iface]]
   if [ "$#" -eq 0 ]; then
     log "[*] hop del (no args): flushing nat PREROUTING for v4+v6..."
     "$IPT4" -t nat -F PREROUTING || true
@@ -356,42 +338,53 @@ hop_status() {
 }
 
 status_all() {
-  echo "== IPv4 filter INPUT policy/rules =="
-  "$IPT4" -S INPUT 2>/dev/null || true
+  echo "== IPv4 filter (full) =="
+  "$IPT4" -S 2>/dev/null || true
   echo
-  echo "== IPv6 filter INPUT policy/rules =="
-  "$IPT6" -S INPUT 2>/dev/null || true
+  echo "== IPv6 filter (full) =="
+  "$IPT6" -S 2>/dev/null || true
   echo
   hop_status
+  echo
+  os="$(detect_os)"
+  if [ "$os" = "alpine" ]; then
+    echo "== Alpine persistence files =="
+    [ -f /etc/iptables/rules-save ] && echo "v4 saved: /etc/iptables/rules-save" || echo "v4 saved: (missing) /etc/iptables/rules-save"
+    [ -f /etc/iptables/rules6-save ] && echo "v6 saved: /etc/iptables/rules6-save" || echo "v6 saved: (missing) /etc/iptables/rules6-save"
+    if have rc-update; then
+      echo "== OpenRC enabled services (grep iptables) =="
+      rc-update show 2>/dev/null | grep -E '(^|\s)(ip6tables|iptables)($|\s)' || true
+    else
+      echo "== OpenRC not detected (containers often have no OpenRC), reboot won't restore iptables automatically =="
+    fi
+  fi
 }
 
 usage() {
   cat <<'EOF'
 Usage:
-  iptables.sh add [SPEC ...]
+  ./iptables.sh add [SPEC ...]
       SPEC: PORT[-PORT][/proto][/family]
       examples:
         ./iptables.sh add 50101
         ./iptables.sh add 50101/tcp
         ./iptables.sh add 50101/tcp/6
         ./iptables.sh add 51010-51111/udp/4
-      If no SPEC provided, enters interactive mode.
 
-  iptables.sh del [SPEC ...]
+  ./iptables.sh del [SPEC ...]
       If no SPEC: flush INPUT/OUTPUT and set policies ACCEPT for v4+v6.
 
-  iptables.sh hop add <TO_PORT> <FROMSPEC> [iface]
-      FROMSPEC: PORT[-PORT][/proto][/family]
+  ./iptables.sh hop add <TO_PORT> <FROMSPEC> [iface]
       examples:
         ./iptables.sh hop add 51010 51011-51111
         ./iptables.sh hop add 51010 51011/udp
         ./iptables.sh hop add 51010 51011-51111/udp/4
 
-  iptables.sh hop del [<TO_PORT> <FROMSPEC> [iface]]
+  ./iptables.sh hop del [<TO_PORT> <FROMSPEC> [iface]]
       If no args: flush nat PREROUTING for v4+v6.
 
-  iptables.sh hop status
-  iptables.sh status
+  ./iptables.sh hop status
+  ./iptables.sh status
 EOF
 }
 
@@ -420,35 +413,22 @@ main() {
     hop)
       sub="${1:-}"; shift || true
       case "$sub" in
-        add)
-          [ "$#" -ge 2 ] || die "hop add needs: <to_port> <fromspec> [iface]"
-          hop_add "$@"
-          ;;
+        add) [ "$#" -ge 2 ] || die "hop add needs: <to_port> <fromspec> [iface]"; hop_add "$@" ;;
         del)
           if [ "$#" -eq 0 ]; then
             hop_del
           else
-            [ "$#" -ge 2 ] || die "hop del needs: <to_port> <fromspec> [iface]  (or no args to flush)"
+            [ "$#" -ge 2 ] || die "hop del needs: <to_port> <fromspec> [iface] (or no args to flush)"
             hop_del "$@"
           fi
           ;;
-        status)
-          hop_status
-          ;;
-        *)
-          die "Unknown hop subcommand. Use: hop add|del|status"
-          ;;
+        status) hop_status ;;
+        *) die "Unknown hop subcommand. Use: hop add|del|status" ;;
       esac
       ;;
-    status)
-      status_all
-      ;;
-    ""|-h|--help|help)
-      usage
-      ;;
-    *)
-      die "Unknown command '$cmd'. Use: add|del|hop|status"
-      ;;
+    status) status_all ;;
+    ""|-h|--help|help) usage ;;
+    *) die "Unknown command '$cmd'. Use: add|del|hop|status" ;;
   esac
 }
 
