@@ -21,6 +21,7 @@
 # 2018-10-31 fix misc routing setup, fix multiple ifaces on same subnet
 # 2019-11-13 removed VLAN metadata validation to work around an issue with VM metadata population for secondary VNICs
 # 2026-04-14 fix: auto-create /etc/iproute2/rt_tables when missing (Debian 13+ / iproute2 >= 6.x)
+# 2026-04-14 fix: install systemd service so secondary VNIC config survives reboot
 
 declare -r THIS=$(basename "$0")
 declare -r MD_URL='http://169.254.169.254/opc/v1/vnics/'
@@ -1293,6 +1294,63 @@ oci_vcn_show() {
     done
 }
 
+
+oci_vcn_install_service() {
+    # Install and enable a systemd one-shot service so that secondary VNIC
+    # configuration is automatically restored after every reboot.
+    # The service records the absolute path to this script at install time.
+    local -r svc_name='oci-secondary-vnic'
+    local -r svc_file="/etc/systemd/system/${svc_name}.service"
+    local -r script_path="$(readlink -f "$0")"
+
+    # Detect systemd
+    if ! command -v systemctl >/dev/null 2>&1; then
+        oci_vcn_warn "systemctl not found; cannot install persist service (non-systemd system)"
+        return
+    fi
+
+    # Preserve any extra flags the caller used (-q / -v / -n / etc.)
+    # We always pass -c; other flags are reconstructed from current state.
+    local extra_flags=''
+    [ -z "$QUIET" ] || extra_flags="$extra_flags -q"
+    [ -z "$DEBUG" ] || extra_flags="$extra_flags -v"
+    [ -z "$USE_NS" ] || extra_flags="$extra_flags -n"
+
+    cat > "$svc_file" <<UNIT
+[Unit]
+Description=OCI Secondary VNIC Configuration
+Documentation=https://docs.oracle.com/en-us/iaas/Content/Network/Tasks/managingVNICs.htm
+# The OCI metadata endpoint (169.254.169.254) is reachable as soon as the
+# primary NIC is up, which happens before network-online.target.
+After=network.target
+Wants=network.target
+# Do NOT start before cloud-init finishes — it may attach VNICs late.
+After=cloud-init.service
+Wants=cloud-init.service
+
+[Service]
+Type=oneshot
+# Retry up to 3 times if the metadata service is momentarily unavailable.
+ExecStart=${script_path} -c${extra_flags}
+Restart=on-failure
+RestartSec=10s
+StartLimitIntervalSec=60s
+StartLimitBurst=3
+RemainAfterExit=yes
+# Log to the journal for easy debugging: journalctl -u oci-secondary-vnic
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+    systemctl daemon-reload                >/dev/null 2>&1 || true
+    systemctl enable  "${svc_name}.service" >/dev/null 2>&1 \
+        || oci_vcn_warn "could not enable ${svc_name}.service"
+    oci_vcn_info "installed + enabled ${svc_file} (runs '$script_path -c${extra_flags}' at every boot)"
+}
+
 oci_vcn_help() {
     cat <<EOF
 NAME
@@ -1441,12 +1499,20 @@ oci_vcn_read
 if [ -n "$config" ]; then
     [ -z "$deconfig" ] || oci_vcn_err "conflicting options"
     oci_vcn_config
+    oci_vcn_install_service   # persist: auto-run on every reboot
     [ -z "$show" ] || oci_vcn_read # reread if show
 elif [ -n "$deconfig" ]; then
     if [ ${#SEC_ADDRS[@]} -gt 0 ]; then # just deconfig addrs
         oci_vcn_config_or_deconfig_sec_addrs
     else # deconfig all
         oci_vcn_deconfig_all
+        # Also disable the persist service so it won't reconfigure on next boot
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl disable oci-secondary-vnic.service >/dev/null 2>&1 || true
+            rm -f /etc/systemd/system/oci-secondary-vnic.service
+            systemctl daemon-reload >/dev/null 2>&1 || true
+            oci_vcn_info "disabled and removed oci-secondary-vnic.service"
+        fi
     fi
     [ -z "$show" ] || oci_vcn_read # reread if show
 else
