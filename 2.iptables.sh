@@ -389,6 +389,10 @@ add_ports() {
 }
 
 del_ports() {
+  src_mode="${1:-any}"
+  src_cidr="${2:-}"
+  shift 2 || true
+
   if [ "$#" -eq 0 ]; then
     log "[*] Clearing INPUT/OUTPUT and allowing all inbound/outbound (policies ACCEPT) for v4+v6..."
     for cmd in "$IPT4" "$IPT6"; do
@@ -404,15 +408,35 @@ del_ports() {
 
   for spec in "$@"; do
     parse_spec "$spec"
+
+    if [ "$src_mode" = "4" ] && ! fam_has4; then
+      die "Spec '$spec' limits family to IPv6, but source selector '$src_cidr' is IPv4."
+    fi
+    if [ "$src_mode" = "6" ] && ! fam_has6; then
+      die "Spec '$spec' limits family to IPv4, but source selector '$src_cidr' is IPv6."
+    fi
+
     for p in $PROTOS; do
       if fam_has4; then
-        ipt_check_del_all_filter "$IPT4" INPUT -p "$p" -m conntrack --ctstate NEW -m "$p" --dport "$PORTSPEC" -j ACCEPT
+        if [ "$src_mode" = "4" ]; then
+          ipt_check_del_all_filter "$IPT4" INPUT -s "$src_cidr" -p "$p" -m conntrack --ctstate NEW -m "$p" --dport "$PORTSPEC" -j ACCEPT
+        elif [ "$src_mode" = "any" ]; then
+          ipt_check_del_all_filter "$IPT4" INPUT -p "$p" -m conntrack --ctstate NEW -m "$p" --dport "$PORTSPEC" -j ACCEPT
+        fi
       fi
       if fam_has6; then
-        ipt_check_del_all_filter "$IPT6" INPUT -p "$p" -m conntrack --ctstate NEW -m "$p" --dport "$PORTSPEC" -j ACCEPT
+        if [ "$src_mode" = "6" ]; then
+          ipt_check_del_all_filter "$IPT6" INPUT -s "$src_cidr" -p "$p" -m conntrack --ctstate NEW -m "$p" --dport "$PORTSPEC" -j ACCEPT
+        elif [ "$src_mode" = "any" ]; then
+          ipt_check_del_all_filter "$IPT6" INPUT -p "$p" -m conntrack --ctstate NEW -m "$p" --dport "$PORTSPEC" -j ACCEPT
+        fi
       fi
     done
-    log "[-] removed: $spec  (proto=$PROTOS, fam=$FAMS)"
+    if [ "$src_mode" = "any" ]; then
+      log "[-] removed: $spec  (src=*, proto=$PROTOS, fam=$FAMS)"
+    else
+      log "[-] removed: $spec  (src=$src_cidr, proto=$PROTOS, fam=$FAMS)"
+    fi
   done
   persist_rules
 }
@@ -563,7 +587,14 @@ Usage:
         ./iptables.sh add 2401:b60::/32 51013/tcp
 
   ./iptables.sh del [SPEC ...]
+      or:   ./iptables.sh del SRC SPEC [SPEC ...]
+      SRC:  * | IPv4_CIDR | IPv6_CIDR
       If no SPEC: flush INPUT/OUTPUT and set policies ACCEPT for v4+v6.
+      examples:
+        ./iptables.sh del 51010
+        ./iptables.sh del * 51010/tcp/6
+        ./iptables.sh del 47.86.231.38/32 51011
+        ./iptables.sh del 2401:b60::/32 51013/tcp
 
   ./iptables.sh hop add <TO_PORT> <FROMSPEC> [iface|any]
       iface: specific interface (e.g. eth0, enp1s0)
@@ -627,7 +658,30 @@ main() {
       add_ports "$src_mode" "$src_cidr" "$@"
       ;;
     del)
-      del_ports "$@"
+      src_mode="any"
+      src_cidr=""
+      first="${1:-}"
+
+      case "$first" in
+        '*')
+          src_mode="any"
+          shift
+          ;;
+        *:*)
+          parse_source_selector "$first"
+          src_mode="$SRC_MODE"
+          src_cidr="$SRC_CIDR"
+          shift
+          ;;
+        *.*/*)
+          parse_source_selector "$first"
+          src_mode="$SRC_MODE"
+          src_cidr="$SRC_CIDR"
+          shift
+          ;;
+      esac
+
+      del_ports "$src_mode" "$src_cidr" "$@"
       ;;
     hop)
       sub="${1:-}"; shift || true
@@ -652,4 +706,3 @@ main() {
 }
 
 main "$@"
-
