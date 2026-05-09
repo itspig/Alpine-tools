@@ -317,20 +317,73 @@ parse_spec() {
 fam_has4() { case " $FAMS " in *" 4 "*) return 0;; *) return 1;; esac; }
 fam_has6() { case " $FAMS " in *" 6 "*) return 0;; *) return 1;; esac; }
 
+# ---------- source selector parsing ----------
+# Output globals: SRC_MODE (any|4|6), SRC_CIDR
+parse_source_selector() {
+  sel="$1"
+  case "$sel" in
+    "") die "Empty source selector." ;;
+    '*') SRC_MODE="any"; SRC_CIDR="" ;;
+    *:*)
+      case "$sel" in
+        */*) : ;;
+        *) die "IPv6 source selector must include CIDR suffix (e.g. 2401:b60::/32)." ;;
+      esac
+      SRC_MODE="6"
+      SRC_CIDR="$sel"
+      ;;
+    *.*)
+      case "$sel" in
+        */*) : ;;
+        *) die "IPv4 source selector must include CIDR suffix (e.g. 162.141.128.0/17)." ;;
+      esac
+      SRC_MODE="4"
+      SRC_CIDR="$sel"
+      ;;
+    *) die "Invalid source selector '$sel'. Use '*', IPv4 CIDR, or IPv6 CIDR." ;;
+  esac
+}
+
 # ---------- add/del ----------
 add_ports() {
+  src_mode="${1:-any}"
+  src_cidr="${2:-}"
+  shift 2 || true
+
+  [ "$#" -gt 0 ] || die "No specs provided."
+
   ensure_initialized
   for spec in "$@"; do
     parse_spec "$spec"
+
+    if [ "$src_mode" = "4" ] && ! fam_has4; then
+      die "Spec '$spec' limits family to IPv6, but source selector '$src_cidr' is IPv4."
+    fi
+    if [ "$src_mode" = "6" ] && ! fam_has6; then
+      die "Spec '$spec' limits family to IPv4, but source selector '$src_cidr' is IPv6."
+    fi
+
     for p in $PROTOS; do
       if fam_has4; then
-        ipt_check_add_filter "$IPT4" INPUT -p "$p" -m conntrack --ctstate NEW -m "$p" --dport "$PORTSPEC" -j ACCEPT
+        if [ "$src_mode" = "4" ]; then
+          ipt_check_add_filter "$IPT4" INPUT -s "$src_cidr" -p "$p" -m conntrack --ctstate NEW -m "$p" --dport "$PORTSPEC" -j ACCEPT
+        elif [ "$src_mode" = "any" ]; then
+          ipt_check_add_filter "$IPT4" INPUT -p "$p" -m conntrack --ctstate NEW -m "$p" --dport "$PORTSPEC" -j ACCEPT
+        fi
       fi
       if fam_has6; then
-        ipt_check_add_filter "$IPT6" INPUT -p "$p" -m conntrack --ctstate NEW -m "$p" --dport "$PORTSPEC" -j ACCEPT
+        if [ "$src_mode" = "6" ]; then
+          ipt_check_add_filter "$IPT6" INPUT -s "$src_cidr" -p "$p" -m conntrack --ctstate NEW -m "$p" --dport "$PORTSPEC" -j ACCEPT
+        elif [ "$src_mode" = "any" ]; then
+          ipt_check_add_filter "$IPT6" INPUT -p "$p" -m conntrack --ctstate NEW -m "$p" --dport "$PORTSPEC" -j ACCEPT
+        fi
       fi
     done
-    log "[+] opened: $spec  (proto=$PROTOS, fam=$FAMS)"
+    if [ "$src_mode" = "any" ]; then
+      log "[+] opened: $spec  (src=*, proto=$PROTOS, fam=$FAMS)"
+    else
+      log "[+] opened: $spec  (src=$src_cidr, proto=$PROTOS, fam=$FAMS)"
+    fi
   done
   persist_rules
 }
@@ -498,11 +551,16 @@ usage() {
 Usage:
   ./iptables.sh add [SPEC ...]
       SPEC: PORT[-PORT][/proto][/family]
+      or:   SRC SPEC [SPEC ...]
+      SRC:  * | IPv4_CIDR | IPv6_CIDR
       examples:
         ./iptables.sh add 50101
         ./iptables.sh add 50101/tcp
         ./iptables.sh add 50101/tcp/6
         ./iptables.sh add 51010-51111/udp/4
+        ./iptables.sh add * 51010
+        ./iptables.sh add 162.141.128.0/17 51012/udp
+        ./iptables.sh add 2401:b60::/32 51013/tcp
 
   ./iptables.sh del [SPEC ...]
       If no SPEC: flush INPUT/OUTPUT and set policies ACCEPT for v4+v6.
@@ -543,7 +601,30 @@ main() {
         set -- $line
         [ "$#" -gt 0 ] || die "No specs provided."
       fi
-      add_ports "$@"
+      src_mode="any"
+      src_cidr=""
+      first="${1:-}"
+
+      case "$first" in
+        '*')
+          src_mode="any"
+          shift
+          ;;
+        *:*)
+          parse_source_selector "$first"
+          src_mode="$SRC_MODE"
+          src_cidr="$SRC_CIDR"
+          shift
+          ;;
+        *.*/*)
+          parse_source_selector "$first"
+          src_mode="$SRC_MODE"
+          src_cidr="$SRC_CIDR"
+          shift
+          ;;
+      esac
+
+      add_ports "$src_mode" "$src_cidr" "$@"
       ;;
     del)
       del_ports "$@"
@@ -571,5 +652,4 @@ main() {
 }
 
 main "$@"
-
 
